@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { fxmacrodataActionHandlers, validateFxmacrodataCredential } from "./runtime.ts";
+import { createProviderFetch } from "../provider-runtime.ts";
+import { fxmacrodataActionHandlers, readFxmacrodataError, validateFxmacrodataCredential } from "./runtime.ts";
 
 interface RecordedRequest {
   url: string;
@@ -98,6 +99,61 @@ describe("FXMacroData runtime", () => {
     await expect(
       fxmacrodataActionHandlers.get_announcements({ currency: "usd", indicator: "cpi_core" }, { fetcher }),
     ).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("maps a keyless proxy 401 to invalid input and keeps a rejected key as a 401", async () => {
+    await expect(readFxmacrodataError(keyRequired())).resolves.toMatchObject({ status: 400 });
+    await expect(
+      readFxmacrodataError(
+        Response.json({ detail: "API key not recognised.", code: "invalid_api_key" }, { status: 401 }),
+      ),
+    ).resolves.toMatchObject({ status: 401 });
+  });
+
+  it("refuses a key that is not a valid header value without echoing it", async () => {
+    const { fetcher, requests } = recordingFetcher(() => Response.json({ data: [] }));
+
+    const error = await fxmacrodataActionHandlers
+      .get_forex({ base: "eur", quote: "usd" }, { apiKey: "abc\nsecret-value", fetcher })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ status: 400 });
+    expect(String((error as Error).message)).not.toContain("secret-value");
+    expect(requests).toEqual([]);
+  });
+
+  it("removes the key from an upstream error message", async () => {
+    const { fetcher } = recordingFetcher(() =>
+      Response.json({ detail: "Key test-key-123 is not active.", key: "test-key-123" }, { status: 403 }),
+    );
+
+    const error = await fxmacrodataActionHandlers
+      .get_cot({ currency: "eur" }, { apiKey: "test-key-123", fetcher })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ status: 403, message: "Key [REDACTED] is not active." });
+    expect(JSON.stringify((error as { details?: unknown }).details)).not.toContain("test-key-123");
+  });
+
+  it.each([
+    ["another origin", "https://elsewhere.example/v1/forex/eur/usd"],
+    ["plain http on the same host", "http://api.fxmacrodata.com/v1/forex/eur/usd"],
+  ])("does not forward the key when a redirect moves to %s", async (_description, location) => {
+    const hops: RecordedRequest[] = [];
+    const transport: typeof fetch = async (input, init) => {
+      hops.push({ url: String(input), apiKey: new Headers(init?.headers).get("x-api-key") });
+      return hops.length === 1
+        ? new Response(null, { status: 302, headers: { location } })
+        : Response.json({ data: [] });
+    };
+    const fetcher = createProviderFetch({ fetch: transport, skipDnsValidation: true });
+
+    await fxmacrodataActionHandlers
+      .get_forex({ base: "eur", quote: "usd" }, { apiKey: "test-key", fetcher })
+      .catch(() => undefined);
+
+    expect(hops[0]?.apiKey).toBe("test-key");
+    expect(hops.slice(1).every((hop) => hop.apiKey === null)).toBe(true);
   });
 
   it.each([

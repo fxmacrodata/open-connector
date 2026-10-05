@@ -21,7 +21,7 @@ export const executors: ProviderExecutors = defineProviderExecutors({
 export const proxy: ProviderProxyExecutor = defineProviderProxy({
   service,
   baseUrl: fxmacrodataApiBaseUrl,
-  auth: { type: "api_key_header", name: "X-API-Key" },
+  auth: { type: "optional_api_key_header", name: "X-API-Key" },
   readError: readFxmacrodataError,
   skipDnsValidation: true,
 });

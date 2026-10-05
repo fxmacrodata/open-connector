@@ -119,14 +119,15 @@ export async function validateFxmacrodataCredential(
 
 /**
  * Read an FXMacroData error response and map it onto the runtime's status conventions.
- * Without a key, a 401 means the data needs a key rather than that a credential is bad,
- * so it is reported as invalid input instead of prompting a reconnect. During key
- * validation a 401 or 403 is a field error on the submitted key.
+ * The API answers a keyless request for data that needs a key with a 401 and the code
+ * api_key_required; that is reported as invalid input, not as a credential to reconnect,
+ * for actions and the proxy alike. During key validation a 401 or 403 is a field error on
+ * the submitted key. When the caller knows the key, it is removed from the message.
  */
 export async function readFxmacrodataError(
   response: Response,
   phase: FxmacrodataPhase = "execute",
-  authenticated = true,
+  apiKey?: string,
 ): Promise<ProviderRequestError> {
   const status = response.status;
   const payload = parseProviderJsonBodyText(await readProviderErrorTextBody(response, "FXMacroData error response"), {
@@ -135,13 +136,28 @@ export async function readFxmacrodataError(
     invalidJsonFallback: () => ({}),
   });
   const body = optionalRecord(payload);
-  const message =
+  const upstreamMessage =
     optionalString(body?.detail) ?? optionalString(body?.message) ?? `FXMacroData request failed with HTTP ${status}`;
-  const details = withRetryAfterSeconds(response, payload);
-  if ((status === 401 || status === 403) && (phase === "validate" || !authenticated)) {
+  const message = apiKey ? upstreamMessage.replaceAll(apiKey, "[REDACTED]") : upstreamMessage;
+  const details = withRetryAfterSeconds(response, apiKey && JSON.stringify(payload).includes(apiKey) ? {} : payload);
+  if (
+    (status === 401 || status === 403) &&
+    (phase === "validate" || optionalString(body?.code) === "api_key_required")
+  ) {
     return new ProviderRequestError(400, message, details);
   }
   return new ProviderRequestError(status, message, details);
+}
+
+/**
+ * Check the key before it goes into a header. The platform's own error for an invalid
+ * header value quotes the value, so a malformed key is refused here without echoing it.
+ */
+function apiKeyHeaderValue(apiKey: string): string {
+  if (!/^[!-~]+$/.test(apiKey)) {
+    throw providerInputError("The FXMacroData API key contains characters that are not valid in an HTTP header.");
+  }
+  return apiKey;
 }
 
 function currencyCode(value: unknown, fieldName: string): string {
@@ -174,12 +190,13 @@ async function requestFxmacrodata(input: FxmacrodataRequest): Promise<Record<str
   for (const [key, value] of Object.entries(queryParams(input.query ?? {}))) {
     url.searchParams.set(key, value);
   }
+  const headers = new Headers({ accept: "application/json", "user-agent": providerUserAgent });
+  if (context.apiKey) headers.set("x-api-key", apiKeyHeaderValue(context.apiKey));
   return runProviderRequest({ signal: context.signal, label: "FXMacroData" }, async (signal) => {
-    const headers = new Headers({ accept: "application/json", "user-agent": providerUserAgent });
-    if (context.apiKey) headers.set("x-api-key", context.apiKey);
+    // context.fetcher follows redirects itself and drops X-API-Key on any change of origin or scheme.
     const response = await context.fetcher(url, { method: "GET", headers, signal });
     if (!response.ok) {
-      throw await readFxmacrodataError(response, input.phase ?? "execute", Boolean(context.apiKey));
+      throw await readFxmacrodataError(response, input.phase ?? "execute", context.apiKey);
     }
     const payload = parseProviderJsonBodyText(await readProviderTextBody(response, "FXMacroData response"), {
       emptyBody: {},
